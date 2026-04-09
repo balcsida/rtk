@@ -321,6 +321,10 @@ enum Commands {
         #[arg(long)]
         gemini: bool,
 
+        /// Initialize for Tabnine CLI instead of Claude Code
+        #[arg(long)]
+        tabnine: bool,
+
         /// Target agent to install hooks for (default: claude)
         #[arg(long, value_enum)]
         agent: Option<AgentTarget>,
@@ -712,7 +716,7 @@ enum Commands {
     /// Exits 0 and prints the rewritten command if supported.
     /// Exits 1 with no output if the command has no RTK equivalent.
     ///
-    /// Used by Claude Code, Gemini CLI, and other LLM hooks:
+    /// Used by Claude Code, Gemini CLI, Tabnine CLI, and other LLM hooks:
     ///   REWRITTEN=$(rtk rewrite "$CMD") || exit 0
     Rewrite {
         /// Raw command to rewrite (e.g. "git status", "cargo test && git push")
@@ -721,7 +725,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Hook processors for LLM CLI tools (Gemini CLI, Copilot, etc.)
+    /// Hook processors for LLM CLI tools (Gemini CLI, Tabnine CLI, Copilot, etc.)
     Hook {
         #[command(subcommand)]
         command: HookCommands,
@@ -736,6 +740,8 @@ enum HookCommands {
     Cursor,
     /// Process Gemini CLI BeforeTool hook (reads JSON from stdin)
     Gemini,
+    /// Process Tabnine CLI BeforeTool hook (reads JSON from stdin)
+    Tabnine,
     /// Process Copilot preToolUse hook (VS Code + Copilot CLI, reads JSON from stdin)
     Copilot,
     /// Check how a command would be rewritten by the hook engine (dry-run)
@@ -1705,6 +1711,7 @@ fn run_cli() -> Result<i32> {
             global,
             opencode,
             gemini,
+            tabnine,
             agent,
             show,
             claude_md,
@@ -1719,7 +1726,7 @@ fn run_cli() -> Result<i32> {
                 hooks::init::show_config(codex)?;
             } else if uninstall {
                 let cursor = agent == Some(AgentTarget::Cursor);
-                hooks::init::uninstall(global, gemini, codex, cursor, cli.verbose)?;
+                hooks::init::uninstall(global, gemini, tabnine, codex, cursor, cli.verbose)?;
             } else if gemini {
                 let patch_mode = if auto_patch {
                     hooks::init::PatchMode::Auto
@@ -1729,6 +1736,15 @@ fn run_cli() -> Result<i32> {
                     hooks::init::PatchMode::Ask
                 };
                 hooks::init::run_gemini(global, hook_only, patch_mode, cli.verbose)?;
+            } else if tabnine {
+                let patch_mode = if auto_patch {
+                    hooks::init::PatchMode::Auto
+                } else if no_patch {
+                    hooks::init::PatchMode::Skip
+                } else {
+                    hooks::init::PatchMode::Ask
+                };
+                hooks::init::run_tabnine(global, hook_only, patch_mode, cli.verbose)?;
             } else if copilot {
                 hooks::init::run_copilot(cli.verbose)?;
             } else if agent == Some(AgentTarget::Kilocode) {
@@ -2067,6 +2083,10 @@ fn run_cli() -> Result<i32> {
             }
             HookCommands::Gemini => {
                 hooks::hook_cmd::run_gemini()?;
+                0
+            }
+            HookCommands::Tabnine => {
+                hooks::hook_cmd::run_tabnine()?;
                 0
             }
             HookCommands::Copilot => {
