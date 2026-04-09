@@ -5,7 +5,9 @@ use super::constants::{
     SETTINGS_JSON,
 };
 #[cfg(test)]
-use super::constants::{CODEX_DIR, CURSOR_DIR, GEMINI_DIR, GEMINI_HOOK_FILE, OPENCODE_PLUGIN_PATH};
+use super::constants::{
+    CODEX_DIR, CURSOR_DIR, GEMINI_DIR, GEMINI_HOOK_FILE, OPENCODE_PLUGIN_PATH, TABNINE_HOOK_FILE,
+};
 use crate::core::constants::RTK_DATA_DIR;
 use std::path::PathBuf;
 
@@ -146,6 +148,11 @@ fn other_integration_installed(home: &std::path::Path) -> bool {
         home.join(GEMINI_DIR)
             .join(HOOKS_SUBDIR)
             .join(GEMINI_HOOK_FILE),
+        // Tabnine settings live under ~/.tabnine/agent/
+        home.join(".tabnine")
+            .join("agent")
+            .join(HOOKS_SUBDIR)
+            .join(TABNINE_HOOK_FILE),
     ];
     paths.iter().any(|p| p.exists())
 }
@@ -257,11 +264,26 @@ mod tests {
     }
 
     #[test]
+    fn test_other_integration_tabnine() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp
+            .path()
+            .join(".tabnine")
+            .join("agent")
+            .join(HOOKS_SUBDIR)
+            .join(TABNINE_HOOK_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"hook").unwrap();
+        assert!(other_integration_installed(tmp.path()));
+    }
+
+    #[test]
     fn test_other_integration_empty_dirs_not_enough() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(CURSOR_DIR).join(HOOKS_SUBDIR)).unwrap();
         std::fs::create_dir_all(tmp.path().join(CODEX_DIR)).unwrap();
         std::fs::create_dir_all(tmp.path().join(GEMINI_DIR)).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".tabnine").join("agent")).unwrap();
         assert!(!other_integration_installed(tmp.path()));
     }
 
