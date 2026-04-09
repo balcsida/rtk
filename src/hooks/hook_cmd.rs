@@ -171,10 +171,25 @@ fn handle_copilot_cli(cmd: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Gemini hook ───────────────────────────────────────────────
+// ── Gemini / Tabnine hook (shared Gemini CLI wire format) ─────
 
 /// Run the Gemini CLI BeforeTool hook.
 pub fn run_gemini() -> Result<()> {
+    run_gemini_format_hook()
+}
+
+/// Run the Tabnine CLI BeforeTool hook.
+///
+/// Tabnine CLI is a fork of Gemini CLI and uses the identical hook wire format
+/// (stdin `tool_name` + `tool_input.command`, stdout `decision`/`hookSpecificOutput`).
+/// This function exists as a dedicated entry point so logs and future divergence
+/// stay clean.
+pub fn run_tabnine() -> Result<()> {
+    run_gemini_format_hook()
+}
+
+/// Shared implementation for Gemini-format BeforeTool hooks.
+fn run_gemini_format_hook() -> Result<()> {
     let input = read_stdin_limited()?;
 
     let json: Value = serde_json::from_str(&input).context("Failed to parse hook input as JSON")?;
@@ -196,7 +211,7 @@ pub fn run_gemini() -> Result<()> {
         return Ok(());
     }
 
-    // Check deny rules — Gemini CLI only supports allow/deny (no ask mode).
+    // Check deny rules — Gemini/Tabnine CLI only support allow/deny (no ask mode).
     if permissions::check_command(cmd) == PermissionVerdict::Deny {
         let _ = writeln!(
             io::stdout(),
@@ -871,5 +886,30 @@ mod tests {
             get_rewritten("cargo test").is_some(),
             "cargo test should be rewritable when not denied"
         );
+    }
+
+    // --- Tabnine parity (Tabnine CLI is a fork of Gemini CLI, same wire format) ---
+
+    #[test]
+    fn test_tabnine_hook_uses_same_rewriter() {
+        assert_eq!(
+            rewrite_command("git status", &[]),
+            Some("rtk git status".into())
+        );
+        assert_eq!(
+            rewrite_command("cargo test", &[]),
+            Some("rtk cargo test".into())
+        );
+        assert_eq!(
+            rewrite_command("rtk git status", &[]),
+            Some("rtk git status".into())
+        );
+        assert_eq!(rewrite_command("cat <<EOF", &[]), None);
+    }
+
+    #[test]
+    fn test_tabnine_and_gemini_share_format_handler() {
+        let _: fn() -> Result<()> = super::run_gemini;
+        let _: fn() -> Result<()> = super::run_tabnine;
     }
 }
