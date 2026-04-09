@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND,
     GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    TABNINE_HOOK_FILE,
 };
 use super::integrity;
 
@@ -534,8 +535,15 @@ fn remove_hook_from_settings(verbose: u8) -> Result<bool> {
     Ok(removed)
 }
 
-/// Full uninstall for Claude, Gemini, Codex, or Cursor artifacts.
-pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose: u8) -> Result<()> {
+/// Full uninstall for Claude, Gemini, Tabnine, Codex, or Cursor artifacts.
+pub fn uninstall(
+    global: bool,
+    gemini: bool,
+    tabnine: bool,
+    codex: bool,
+    cursor: bool,
+    verbose: u8,
+) -> Result<()> {
     if codex {
         return uninstall_codex(global, verbose);
     }
@@ -577,6 +585,22 @@ pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose:
             println!("\nRestart Gemini CLI to apply changes.");
         } else {
             println!("RTK Gemini support was not installed (nothing to remove)");
+        }
+        return Ok(());
+    }
+
+    // Uninstall Tabnine artifacts if --tabnine
+    if tabnine {
+        let tabnine_removed = uninstall_tabnine(verbose)?;
+        removed.extend(tabnine_removed);
+        if !removed.is_empty() {
+            println!("RTK uninstalled (Tabnine):");
+            for item in &removed {
+                println!("  - {}", item);
+            }
+            println!("\nRestart Tabnine CLI to apply changes.");
+        } else {
+            println!("RTK Tabnine support was not installed (nothing to remove)");
         }
         return Ok(());
     }
@@ -2460,6 +2484,229 @@ fn uninstall_gemini(verbose: u8) -> Result<Vec<String>> {
 
     if verbose > 0 && !removed.is_empty() {
         eprintln!("Gemini artifacts removed");
+    }
+
+    Ok(removed)
+}
+
+// ─── Tabnine CLI support ──────────────────────────────────────────
+//
+// Tabnine CLI is a fork of Gemini CLI and uses the identical hook wire
+// format. The install/uninstall flow mirrors the Gemini flow exactly, with
+// two path differences:
+//   - Config dir: ~/.tabnine/agent/ (vs ~/.gemini/)
+//   - Context file: AGENTS.md (vs GEMINI.md) — Tabnine's default
+//     `contextFileName` per its bundled source (`rPn="AGENTS.md"`).
+
+/// Tabnine hook wrapper script — delegates to `rtk hook tabnine`
+const TABNINE_HOOK_SCRIPT: &str = r#"#!/bin/bash
+exec rtk hook tabnine
+"#;
+
+fn resolve_tabnine_agent_dir() -> Result<PathBuf> {
+    resolve_home_subdir(".tabnine/agent")
+}
+
+/// Entry point for `rtk init --tabnine`
+pub fn run_tabnine(
+    global: bool,
+    hook_only: bool,
+    patch_mode: PatchMode,
+    verbose: u8,
+) -> Result<()> {
+    if !global {
+        anyhow::bail!("Tabnine support is global-only. Use: rtk init -g --tabnine");
+    }
+
+    let tabnine_dir = resolve_tabnine_agent_dir()?;
+    fs::create_dir_all(&tabnine_dir).with_context(|| {
+        format!(
+            "Failed to create Tabnine config dir: {}",
+            tabnine_dir.display()
+        )
+    })?;
+
+    // 1. Install hook script
+    let hook_dir = tabnine_dir.join("hooks");
+    fs::create_dir_all(&hook_dir)
+        .with_context(|| format!("Failed to create hook dir: {}", hook_dir.display()))?;
+    let hook_path = hook_dir.join(TABNINE_HOOK_FILE);
+    write_if_changed(&hook_path, TABNINE_HOOK_SCRIPT, "Tabnine hook", verbose)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("Failed to set hook permissions: {}", hook_path.display()))?;
+    }
+
+    // 2. Install AGENTS.md (RTK awareness for Tabnine)
+    if !hook_only {
+        let agents_md_path = tabnine_dir.join(AGENTS_MD);
+        // Reuse the same slim RTK awareness content used by the Gemini install.
+        write_if_changed(&agents_md_path, RTK_SLIM, AGENTS_MD, verbose)?;
+    }
+
+    // 3. Patch ~/.tabnine/agent/settings.json
+    patch_tabnine_settings(&tabnine_dir, &hook_path, patch_mode, verbose)?;
+
+    println!("\nTabnine CLI hook installed (global).\n");
+    println!("  Hook: {}", hook_path.display());
+    if !hook_only {
+        println!("  AGENTS.md: {}", tabnine_dir.join(AGENTS_MD).display());
+    }
+    println!("  Restart Tabnine CLI. Test with: git status\n");
+    Ok(())
+}
+
+/// Patch ~/.tabnine/agent/settings.json with the BeforeTool hook
+fn patch_tabnine_settings(
+    tabnine_dir: &Path,
+    hook_path: &Path,
+    patch_mode: PatchMode,
+    verbose: u8,
+) -> Result<()> {
+    let settings_path = tabnine_dir.join(SETTINGS_JSON);
+    let hook_cmd = hook_path.to_string_lossy().to_string();
+
+    // Read or create settings.json
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)
+            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let before_tool_pointer = format!("/hooks/{}", BEFORE_TOOL_KEY);
+    if let Some(hooks) = settings.pointer(&before_tool_pointer) {
+        if let Some(arr) = hooks.as_array() {
+            if arr.iter().any(|h| {
+                h.pointer("/hooks/0/command")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|c| c.contains("rtk"))
+            }) {
+                if verbose > 0 {
+                    eprintln!("Tabnine settings.json already has RTK hook");
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // Ask user before patching
+    if patch_mode == PatchMode::Skip {
+        println!(
+            "\nManual setup needed: add RTK hook to {}\n\
+             See: https://github.com/rtk-ai/rtk#tabnine-cli",
+            settings_path.display()
+        );
+        return Ok(());
+    }
+
+    if patch_mode == PatchMode::Ask {
+        print!("Patch {} with RTK hook? [y/N] ", settings_path.display());
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("Skipped. Add hook manually later.");
+            return Ok(());
+        }
+    }
+
+    // Build hook entry matching Tabnine/Gemini CLI format
+    let hook_entry = serde_json::json!({
+        "matcher": "run_shell_command",
+        "hooks": [{
+            "type": "command",
+            "command": hook_cmd
+        }]
+    });
+
+    // Insert into settings
+    let hooks = settings
+        .as_object_mut()
+        .context("settings.json is not an object")?
+        .entry("hooks")
+        .or_insert(serde_json::json!({}));
+
+    let before_tool = hooks
+        .as_object_mut()
+        .context("hooks is not an object")?
+        .entry(BEFORE_TOOL_KEY)
+        .or_insert(serde_json::json!([]));
+
+    before_tool
+        .as_array_mut()
+        .context("BeforeTool is not an array")?
+        .push(hook_entry);
+
+    // Write atomically
+    let content = serde_json::to_string_pretty(&settings)?;
+    let tmp = NamedTempFile::new_in(tabnine_dir)?;
+    fs::write(tmp.path(), &content)?;
+    tmp.persist(&settings_path)
+        .with_context(|| format!("Failed to write {}", settings_path.display()))?;
+
+    if verbose > 0 {
+        eprintln!("Patched {}", settings_path.display());
+    }
+
+    Ok(())
+}
+
+/// Remove Tabnine artifacts during uninstall
+fn uninstall_tabnine(verbose: u8) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let tabnine_dir = match resolve_tabnine_agent_dir() {
+        Ok(d) => d,
+        Err(_) => return Ok(removed),
+    };
+
+    // Remove hook
+    let hook_path = tabnine_dir.join(HOOKS_SUBDIR).join(TABNINE_HOOK_FILE);
+    if hook_path.exists() {
+        fs::remove_file(&hook_path)
+            .with_context(|| format!("Failed to remove {}", hook_path.display()))?;
+        removed.push(format!("Tabnine hook: {}", hook_path.display()));
+    }
+
+    // Remove AGENTS.md (RTK-owned in Gemini-style install)
+    let agents_md = tabnine_dir.join(AGENTS_MD);
+    if agents_md.exists() {
+        fs::remove_file(&agents_md)
+            .with_context(|| format!("Failed to remove {}", agents_md.display()))?;
+        removed.push(format!("AGENTS.md: {}", agents_md.display()));
+    }
+
+    // Remove hook from settings.json
+    let settings_path = tabnine_dir.join(SETTINGS_JSON);
+    if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)?;
+        if let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&content) {
+            let bt_pointer = format!("/hooks/{}", BEFORE_TOOL_KEY);
+            if let Some(arr) = settings
+                .pointer_mut(&bt_pointer)
+                .and_then(|v| v.as_array_mut())
+            {
+                let before = arr.len();
+                arr.retain(|h| {
+                    !h.pointer("/hooks/0/command")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|c| c.contains("rtk"))
+                });
+                if arr.len() < before {
+                    let new_content = serde_json::to_string_pretty(&settings)?;
+                    fs::write(&settings_path, new_content)?;
+                    removed.push("Tabnine settings.json: removed RTK hook entry".to_string());
+                }
+            }
+        }
+    }
+
+    if verbose > 0 && !removed.is_empty() {
+        eprintln!("Tabnine artifacts removed");
     }
 
     Ok(removed)
